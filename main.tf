@@ -1,3 +1,5 @@
+#might need to provide access_key and secret_key
+
 provider "aws" {
   region = local.region
 }
@@ -37,13 +39,6 @@ provider "grafana" {
 
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
-
-data "aws_acm_certificate" "issued" {
-  count = var.acm_certificate_domain == null ? 0 : 1
-
-  domain   = var.acm_certificate_domain
-  statuses = ["ISSUED"]
-}
 
 data "aws_eks_cluster_auth" "this" {
   name = module.eks_blueprints.eks_cluster_id
@@ -124,57 +119,6 @@ module "eks_blueprints" {
   }
 
   tags = local.tags
-}
-
-#---------------------------------------------------------------
-# EKS Blueprints AddOns
-#---------------------------------------------------------------
-module "eks_blueprints_kubernetes_addons" {
-  source = "../../../modules/kubernetes-addons"
-
-  eks_cluster_id       = module.eks_blueprints.eks_cluster_id
-  eks_cluster_endpoint = module.eks_blueprints.eks_cluster_endpoint
-  eks_oidc_provider    = module.eks_blueprints.oidc_provider
-  eks_cluster_version  = module.eks_blueprints.eks_cluster_version
-  eks_cluster_domain   = var.eks_cluster_domain
-
-  # Add-Ons
-  enable_kuberay_operator             = true
-  enable_ingress_nginx                = true
-  enable_aws_load_balancer_controller = true
-  enable_external_dns                 = var.eks_cluster_domain == null ? false : true
-  enable_kube_prometheus_stack        = true
-
-  # Add-on customizations
-  ingress_nginx_helm_config = {
-    values = [templatefile("${path.module}/helm-values/nginx-values.yaml", {
-      hostname     = var.eks_cluster_domain
-      ssl_cert_arn = var.acm_certificate_domain == null ? null : data.aws_acm_certificate.issued[0].arn
-    })]
-  }
-  kube_prometheus_stack_helm_config = {
-    values = [templatefile("${path.module}/helm-values/kube-stack-prometheus-values.yaml", {
-      hostname = var.eks_cluster_domain
-    })]
-    set_sensitive = [
-      {
-        name  = "grafana.adminPassword"
-        value = aws_secretsmanager_secret_version.grafana.secret_string
-      }
-    ]
-  }
-
-  tags = local.tags
-}
-
-data "kubernetes_ingress_v1" "ingress" {
-  metadata {
-    name      = "ray-cluster-ingress"
-    namespace = local.namespace
-  }
-  depends_on = [
-    kubectl_manifest.cluster_provisioner
-  ]
 }
 
 #---------------------------------------------------------------
@@ -269,52 +213,6 @@ resource "kubectl_manifest" "cluster_provisioner" {
     module.cluster_irsa,
     module.eks_blueprints_kubernetes_addons
   ]
-}
-
-#---------------------------------------------------------------
-# Monitoring
-#---------------------------------------------------------------
-resource "kubectl_manifest" "prometheus" {
-  yaml_body = templatefile("monitoring/monitor.yaml", {
-    namespace = local.namespace
-  })
-
-  depends_on = [
-    module.eks_blueprints_kubernetes_addons,
-    kubectl_manifest.cluster_provisioner
-  ]
-}
-
-resource "random_password" "grafana" {
-  length           = 16
-  special          = true
-  override_special = "!#$%&*()-_=+[]{}<>:?"
-}
-
-#tfsec:ignore:aws-ssm-secret-use-customer-key
-resource "aws_secretsmanager_secret" "grafana" {
-  name_prefix             = "grafana-"
-  recovery_window_in_days = 0 # Set to zero for this example to force delete during Terraform destroy
-}
-
-resource "aws_secretsmanager_secret_version" "grafana" {
-  secret_id     = aws_secretsmanager_secret.grafana.id
-  secret_string = random_password.grafana.result
-}
-
-resource "grafana_folder" "ray" {
-  title = "ray"
-
-  depends_on = [
-    module.eks_blueprints_kubernetes_addons
-  ]
-}
-
-resource "grafana_dashboard" "ray" {
-  for_each = fileset("${path.module}/monitoring", "*.json")
-
-  config_json = file("${path.module}/monitoring/${each.value}")
-  folder      = grafana_folder.ray.id
 }
 
 #---------------------------------------------------------------
